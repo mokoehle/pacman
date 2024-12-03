@@ -1,8 +1,10 @@
 import random
 import contest.util as util
+import heapq
 
 from contest.capture_agents import CaptureAgent
 from contest.game import Directions
+from game import Actions  # Import Actions here
 from contest.util import nearest_point
 
 
@@ -52,7 +54,8 @@ class ReflexCaptureAgent(CaptureAgent):
         if food_left <= 2:
             best_dist = 9999
             best_action = None
-            for action in actions:
+
+            for action in best_actions:
                 successor = self.get_successor(game_state, action)
                 pos2 = successor.get_agent_position(self.index)
                 dist = self.get_maze_distance(self.start, pos2)
@@ -60,20 +63,7 @@ class ReflexCaptureAgent(CaptureAgent):
                     best_action = action
                     best_dist = dist
             return best_action
-
         return random.choice(best_actions)
-
-    def get_successor(self, game_state, action):
-        """
-        Finds the next successor which is a grid position (location tuple).
-        """
-        successor = game_state.generate_successor(self.index, action)
-        pos = successor.get_agent_state(self.index).get_position()
-        if pos != nearest_point(pos):
-            # Only half a grid position was covered
-            return successor.generate_successor(self.index, action)
-        else:
-            return successor
 
     def evaluate(self, game_state, action):
         """
@@ -83,115 +73,133 @@ class ReflexCaptureAgent(CaptureAgent):
         weights = self.get_weights(game_state, action)
         return features * weights
 
-    def get_features(self, game_state, action):
+    def get_successor(self, game_state, action):
         """
-        Returns a counter of features for the state
+        Finds the next successor which is a grid position (location tuple).
         """
-        features = util.Counter()
-        successor = self.get_successor(game_state, action)
-        features['successor_score'] = self.get_score(successor)
-        return features
-
-    def get_weights(self, game_state, action):
-        """
-        Normally, weights do not depend on the game state.  They can be either
-        a counter or a dictionary.
-        """
-        return {'successor_score': 1.0}
+        successor = game_state.generate_successor(self.index, action)
+        pos = successor.get_agent_state(self.index).get_position()
+        if pos != nearest_point(pos):
+            return successor.generate_successor(self.index, action)
+        else:
+            return successor
 
 
-
-    
 class DefensiveAgentFinal(ReflexCaptureAgent):
-    # A reflex agent that keeps its side Pacman-free and also collects food.
+    """
+    A reflex agent that keeps its side Pacman-free and also collects food.
+    """
     def get_features(self, game_state, action):
         features = util.Counter()
         successor = self.get_successor(game_state, action)
         my_state = successor.get_agent_state(self.index)
         my_pos = my_state.get_position()
 
-        # Check if we are on defense (1) or offense (0)
+        # Computes whether we're on defense (1) or offense (0)
         features['on_defense'] = 1
-        if my_state.is_pacman:
-            features['on_defense'] = 0
+        if my_state.is_pacman: features['on_defense'] = 0
 
-        # Calculate distance to invaders we can see
+        # Computes distance to invaders we can see
         enemies = [successor.get_agent_state(i) for i in self.get_opponents(successor)]
         invaders = [a for a in enemies if a.is_pacman and a.get_position() is not None]
         features['num_invaders'] = len(invaders)
         if len(invaders) > 0:
-            dists = [self.get_maze_distance(my_pos, a.get_position()) for a in invaders]
+            dists = [self.a_star_search(my_pos, a.get_position(), game_state) for a in invaders]
             features['invader_distance'] = min(dists)
 
-        # Calculate distance to the nearest food
-        food_list = self.get_food(successor).as_list()
-        if len(food_list) > 0:
-            min_distance = min([self.get_maze_distance(my_pos, food) for food in food_list])
-            features['distance_to_food'] = min_distance
+        # Add a feature for stopping
+        if action == Directions.STOP:
+            features['stop'] = 1
 
-        # Calculate distance to the nearest capsule
-        capsule_list = self.get_capsules(successor)
-        if len(capsule_list) > 0:
-            min_capsule_distance = min([self.get_maze_distance(my_pos, capsule) for capsule in capsule_list])
-            features['distance_to_capsule'] = min_capsule_distance
-
-        # Calculate distance to the nearest ghost if the agent is a Pacman
-        if my_state.is_pacman:
-            ghosts = [a for a in enemies if not a.is_pacman and a.get_position() is not None]
-            if len(ghosts) > 0:
-                ghost_distances = [self.get_maze_distance(my_pos, ghost.get_position()) for ghost in ghosts]
-                features['distance_to_ghost'] = min(ghost_distances)
+        # Add a feature for reversing direction
+        rev = Directions.REVERSE[game_state.get_agent_state(self.index).configuration.direction]
+        if action == rev:
+            features['reverse'] = 1
 
         return features
 
     def get_weights(self, game_state, action):
-        weights = {
+        return {
             'on_defense': 100,
             'num_invaders': -1000,
             'invader_distance': -10,
-            'distance_to_food': -1,
-            'distance_to_capsule': -1,
-            'distance_to_ghost': 1,  # Negative weight to avoid ghosts
             'stop': -100,
             'reverse': -2
         }
 
-        # Increase the weight for returning to own side if carrying enough food
-        my_state = game_state.get_agent_state(self.index)
-        if my_state.num_carrying >= 5:
-            weights['distance_to_food'] = 0  # Stop prioritizing food
-            weights['distance_to_ghost'] = 0  # Stop avoiding ghosts
-            weights['distance_to_border'] = -100  # Prioritize returning to own side
+    def a_star_search(self, start, goal, game_state):
+        """
+        A* search algorithm to find the shortest path from start to goal.
+        """
+        open_list = []
+        heapq.heappush(open_list, (0, start))
+        came_from = {}
+        g_score = {start: 0}
+        f_score = {start: self.heuristic(start, goal)}
 
-        return weights
+        while open_list:
+            _, current = heapq.heappop(open_list)
 
-    def get_distance_to_border(self, my_pos, game_state):
-        # Get the distance to the border closest to the agent's starting side.
-        mid_x = game_state.data.layout.width // 2
-        if self.red:
-            mid_x -= 1
-        else:
-            mid_x += 1
-        border_positions = [(mid_x, y) for y in range(game_state.data.layout.height) if not game_state.has_wall(mid_x, y)]
-        return min([self.get_maze_distance(my_pos, border) for border in border_positions])
+            if current == goal:
+                return g_score[current]
+
+            for neighbor in self.get_neighbors(current, game_state):
+                tentative_g_score = g_score[current] + 1
+
+                if neighbor not in g_score or tentative_g_score < g_score[neighbor]:
+                    came_from[neighbor] = current
+                    g_score[neighbor] = tentative_g_score
+                    f_score[neighbor] = g_score[neighbor] + self.heuristic(neighbor, goal)
+                    heapq.heappush(open_list, (f_score[neighbor], neighbor))
+
+        return float('inf')
+
+    def heuristic(self, pos, goal):
+        """
+        Heuristic function for A* search.
+        """
+        return self.get_maze_distance(pos, goal)
+
+    def get_neighbors(self, pos, game_state):
+        """
+        Get neighbors of the current position.
+        """
+        neighbors = []
+        for direction in [Directions.NORTH, Directions.SOUTH, Directions.EAST, Directions.WEST]:
+            x, y = pos
+            dx, dy = Actions.direction_to_vector(direction)
+            next_x, next_y = int(x + dx), int(y + dy)
+            if not game_state.has_wall(next_x, next_y):
+                neighbors.append((next_x, next_y))
+        return neighbors
+
 
 class PowerPelletAgent(ReflexCaptureAgent):
-    # A reflex agent that seeks power pellets (capsules), returns to its own side,
-    # and eats enemy Pacmen when on its own side.
+    """
+    A reflex agent that seeks power pellets (capsules), returns to its own side,
+    and eats enemy Pacmen when on its own side.
+    """
     def get_features(self, game_state, action):
         features = util.Counter()
         successor = self.get_successor(game_state, action)
         my_state = successor.get_agent_state(self.index)
         my_pos = my_state.get_position()
 
-        # Calculate distance to the nearest capsule on the opponent's side
+        # Compute distance to the nearest capsule on the opponent's side
         capsule_list = self.get_capsules(successor)
         opponent_side_capsules = [capsule for capsule in capsule_list if self.is_on_opponent_side(capsule)]
         if len(opponent_side_capsules) > 0:
             min_capsule_distance = min([self.get_maze_distance(my_pos, capsule) for capsule in opponent_side_capsules])
             features['distance_to_capsule'] = min_capsule_distance
 
-        # Calculate distance to the nearest ghost if the agent is a Pacman
+        # Compute distance to the nearest food on the opponent's side
+        food_list = self.get_food(successor).as_list()
+        opponent_side_food = [food for food in food_list if self.is_on_opponent_side(food)]
+        if len(opponent_side_food) > 0:
+            min_food_distance = min([self.get_maze_distance(my_pos, food) for food in opponent_side_food])
+            features['distance_to_food'] = min_food_distance
+
+        # Compute distance to the nearest ghost if the agent is a Pacman
         if my_state.is_pacman:
             enemies = [successor.get_agent_state(i) for i in self.get_opponents(successor)]
             ghosts = [a for a in enemies if not a.is_pacman and a.get_position() is not None]
@@ -199,7 +207,7 @@ class PowerPelletAgent(ReflexCaptureAgent):
                 ghost_distances = [self.get_maze_distance(my_pos, ghost.get_position()) for ghost in ghosts]
                 features['distance_to_ghost'] = min(ghost_distances)
 
-        # Calculate distance to the nearest enemy Pacman if the agent is a ghost
+        # Compute distance to the nearest enemy Pacman if the agent is a ghost
         if not my_state.is_pacman:
             enemies = [successor.get_agent_state(i) for i in self.get_opponents(successor)]
             enemy_pacmen = [a for a in enemies if a.is_pacman and a.get_position() is not None]
@@ -221,6 +229,7 @@ class PowerPelletAgent(ReflexCaptureAgent):
     def get_weights(self, game_state, action):
         weights = {
             'distance_to_capsule': -10,  # Increase priority for capsules
+            'distance_to_food': -5,  # Increase priority for food
             'distance_to_ghost': 1,  # Negative weight to avoid ghosts
             'distance_to_enemy_pacman': -10,  # Increase priority for eating enemy Pacmen
             'stop': -100,  # Strongly discourage stopping
@@ -233,10 +242,35 @@ class PowerPelletAgent(ReflexCaptureAgent):
             weights['distance_to_capsule'] = 0  # Stop prioritizing capsules
             weights['distance_to_border'] = -100  # Prioritize returning to own side
 
+        # If the agent has eaten a capsule, prioritize attacking ghosts
+        if my_state.scared_timer > 0:
+            weights['distance_to_ghost'] = -10  # Prioritize attacking ghosts
+
         return weights
 
+    def evaluate(self, game_state, action):
+        """
+        Computes a linear combination of features and feature weights
+        """
+        features = self.get_features(game_state, action)
+        weights = self.get_weights(game_state, action)
+        return features * weights
+
+    def get_successor(self, game_state, action):
+        """
+        Finds the next successor which is a grid position (location tuple).
+        """
+        successor = game_state.generate_successor(self.index, action)
+        pos = successor.get_agent_state(self.index).get_position()
+        if pos != nearest_point(pos):
+            return successor.generate_successor(self.index, action)
+        else:
+            return successor
+
     def is_on_opponent_side(self, pos):
-        # Check if a position is on the opponent's side.
+        """
+        Check if a position is on the opponent's side.
+        """
         mid_x = self.get_border_x()
         if self.red:
             return pos[0] > mid_x
@@ -244,7 +278,9 @@ class PowerPelletAgent(ReflexCaptureAgent):
             return pos[0] < mid_x
 
     def get_border_x(self):
-        # Get the x-coordinate of the border closest to the agent's starting side.
+        """
+        Get the x-coordinate of the border closest to the agent's starting side.
+        """
         mid_x = self.get_current_observation().data.layout.width // 2
         if self.red:
             mid_x -= 1
@@ -253,7 +289,9 @@ class PowerPelletAgent(ReflexCaptureAgent):
         return mid_x
 
     def get_distance_to_border(self, my_pos, game_state):
-        # Get the distance to the border closest to the agent's starting side.
+        """
+        Get the distance to the border closest to the agent's starting side.
+        """
         mid_x = self.get_border_x()
         border_positions = [(mid_x, y) for y in range(game_state.data.layout.height) if not game_state.has_wall(mid_x, y)]
         return min([self.get_maze_distance(my_pos, border) for border in border_positions])
